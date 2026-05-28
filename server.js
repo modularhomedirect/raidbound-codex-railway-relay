@@ -35,8 +35,13 @@ function publicJob(job) {
       has_zip: !!(job.handoff && job.handoff.zip_base64)
     },
     agent_id: job.agent_id || '',
-    log_tail: safeTail(job.log_tail || ''),
-    error: job.error || ''
+    phase: job.phase || '',
+    log_tail: safeTail([job.final_text, job.log_tail, job.stdout_tail, job.stderr_tail].filter(Boolean).join('\n')),
+    stdout_tail: safeTail(job.stdout_tail || ''),
+    stderr_tail: safeTail(job.stderr_tail || ''),
+    final_text: safeTail(job.final_text || '', 40000),
+    error: job.error || '',
+    meta: job.meta || {}
   };
 }
 function auth(req, res, next) {
@@ -57,7 +62,7 @@ function purgeOldJobs() {
 
 const app = express();
 app.use(express.json({ limit: `${MAX_PAYLOAD_MB}mb` }));
-app.get('/health', (req, res) => res.json({ ok: true, service: 'raidbound-codex-railway-relay', secret_configured: !!SECRET, queued_jobs: jobs.size }));
+app.get('/health', (req, res) => res.json({ ok: true, service: 'raidbound-codex-railway-relay', version: '1.0.1', secret_configured: !!SECRET, queued_jobs: jobs.size, supports_meta: true, supports_paused: true, supports_final_text: true }));
 
 app.post('/v1/codex/jobs', auth, (req, res) => {
   purgeOldJobs();
@@ -74,6 +79,10 @@ app.post('/v1/codex/jobs', auth, (req, res) => {
     config: req.body.config || {},
     handoff,
     log_tail: '',
+    stdout_tail: '',
+    stderr_tail: '',
+    final_text: '',
+    phase: 'queued',
     error: ''
   };
   jobs.set(job.job_id, job);
@@ -108,11 +117,16 @@ app.post('/v1/agent/jobs/:id/status', auth, (req, res) => {
   if (!job) return res.status(404).json({ error: 'not_found', message: 'Job not found or expired.' });
   const body = req.body || {};
   if (body.status) job.status = String(body.status);
+  if (body.phase) job.phase = String(body.phase);
   if (body.progress != null) job.progress = Math.max(0, Math.min(100, parseInt(body.progress, 10) || 0));
   if (body.message) job.message = String(body.message);
-  if (body.log_tail || body.stdout_tail || body.stderr_tail) job.log_tail = safeTail([body.log_tail, body.stdout_tail, body.stderr_tail].filter(Boolean).join('\n'));
+  if (body.log_tail) job.log_tail = safeTail(body.log_tail);
+  if (body.stdout_tail) job.stdout_tail = safeTail(body.stdout_tail);
+  if (body.stderr_tail) job.stderr_tail = safeTail(body.stderr_tail);
+  if (body.final_text) job.final_text = safeTail(body.final_text, 40000);
   if (body.error) job.error = String(body.error);
-  if (job.status === 'complete' || job.status === 'error' || job.status === 'failed') job.finished_utc = now();
+  if (body.meta && typeof body.meta === 'object') job.meta = body.meta;
+  if (job.status === 'complete' || job.status === 'error' || job.status === 'failed' || job.status === 'paused') job.finished_utc = now();
   job.updated_utc = now();
   res.json({ job: publicJob(job) });
 });
