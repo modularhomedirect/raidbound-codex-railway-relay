@@ -1,36 +1,36 @@
-# Raidbound Codex Railway Relay
+# Raidbound Codex Railway Relay v1.1.1
 
-This is a server bridge between the WordPress plugin and a local Unity/Codex machine.
+Small authenticated relay used by WordPress and the local Unity machine.
 
-It does **not** clone the Unity repository and does **not** use GitHub for code communication. WordPress uploads a Codex handoff ZIP to this relay, and your local polling agent pulls the job outbound from your Unity machine.
+## v1.1.1 changes
 
-## Deploy on Railway
+- Persists jobs to disk so Railway restarts do not erase queued/claimed/running job records.
+- Requeues stale `claimed`/`running` jobs after `CLAIM_STALE_MS` with a default of 2 hours.
+- Uses `RBOUR_RELAY_DATA_DIR`, `RAILWAY_VOLUME_MOUNT_PATH`, or `./data` for `codex-jobs.json`.
+- `/health` reports `supports_persistence`, `supports_stale_requeue`, and `data_dir`.
+
+## Environment
 
 ```bash
-cd worker/raidbound-codex-railway-relay
-npm install
-npm start
-```
-
-Railway variables:
-
-```txt
-RBOUR_CODEX_RELAY_SECRET=make-a-long-random-secret
+RBOUR_CODEX_RELAY_SECRET=your-long-secret
+RBOUR_RELAY_DATA_DIR=/data   # recommended when Railway volume is mounted
 MAX_PAYLOAD_MB=120
 JOB_TTL_MS=86400000
+CLAIM_STALE_MS=7200000
 ```
-
-In WordPress, set **Railway relay URL** to your deployed service URL and use the same secret.
 
 ## Endpoints
 
-- `POST /v1/codex/jobs` from WordPress
-- `GET /v1/codex/jobs/:id` from WordPress polling
-- `GET /v1/agent/jobs/next?agent_id=...` from the local agent
-- `POST /v1/agent/jobs/:id/status` from the local agent
+- `GET /health`
+- `POST /v1/codex/jobs`
+- `GET /v1/codex/jobs/:id`
+- `GET /v1/agent/jobs/next?agent_id=...`
+- `POST /v1/agent/jobs/:id/status`
 
-All private endpoints require `Authorization: Bearer <RBOUR_CODEX_RELAY_SECRET>`.
+Keep the relay secret outside source control and configure it as a Railway variable.
 
-## Storage note
 
-This lightweight relay stores jobs in memory. That is good enough for a private bridge, but a Railway restart clears queued jobs. For production durability, add Redis/Postgres storage.
+## v1.1.2 context-safe update
+
+- Nested error/status objects are serialized as readable JSON instead of `[object Object]`.
+- Jobs marked with context-window failures get `meta.context_window_failure=true` for the WordPress console.
