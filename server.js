@@ -13,6 +13,7 @@ const CLAIM_STALE_MS = parseInt(process.env.CLAIM_STALE_MS || String(2 * 60 * 60
 const DATA_DIR = path.resolve(process.env.RBOUR_RELAY_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(process.cwd(), 'data'));
 const JOBS_FILE = path.join(DATA_DIR, 'codex-jobs.json');
 const HANDOFF_DIR = path.join(DATA_DIR, 'handoffs');
+const RELAY_VERSION = '1.1.4';
 const jobs = new Map();
 
 function now() { return new Date().toISOString(); }
@@ -45,6 +46,13 @@ function safeTail(value, max = 16000) {
 function looksLikeContextWindowError(value) {
   const text = stringifyForRelay(value).toLowerCase();
   return !!text && (text.includes('ran out of room in the model') || text.includes('context window') || text.includes('start a new thread') || text.includes('clear earlier history') || text.includes('maximum context') || text.includes('context length') || text.includes('too many tokens') || text.includes('token limit exceeded') || text.includes('input is too large'));
+}
+function normalizeCodexModel(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '');
+}
+function jobCodexModel(job) {
+  const cfg = (job && job.config && typeof job.config === 'object') ? job.config : {};
+  return normalizeCodexModel(cfg.codex_model || cfg.codexModel || (job && (job.codex_model || job.codexModel)) || '');
 }
 function handoffPathFor(jobId) {
   return path.join(HANDOFF_DIR, jobId + '.zip.b64');
@@ -109,6 +117,7 @@ function compactJob(job) {
     finished_utc: job.finished_utc || null,
     agent_id: job.agent_id || '',
     phase: job.phase || '',
+    codex_model: jobCodexModel(job),
     source: job.source || {},
     config: job.config || {},
     handoff: {
@@ -186,7 +195,7 @@ app.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 app.get('/health', (req, res) => res.json({
   ok: true,
   service: 'raidbound-codex-railway-relay',
-  version: '1.1.3',
+  version: RELAY_VERSION,
   secret_configured: !!SECRET,
   queued_jobs: jobs.size,
   supports_meta: true,
@@ -196,6 +205,7 @@ app.get('/health', (req, res) => res.json({
   supports_stale_requeue: true,
   supports_fast_status: true,
   supports_split_handoff_storage: true,
+  supports_codex_model_config: true,
   data_dir: DATA_DIR
 }));
 
@@ -207,6 +217,13 @@ app.post('/v1/codex/jobs', auth, (req, res) => {
   const zipFile = writeHandoffZip(jobId, handoff.zip_base64);
   const storedHandoff = { ...handoff, zip_file: zipFile, has_zip: true };
   delete storedHandoff.zip_base64;
+  const rawConfig = (req.body.config && typeof req.body.config === 'object') ? req.body.config : {};
+  const codexModel = normalizeCodexModel(rawConfig.codex_model || rawConfig.codexModel || req.body.codex_model || req.body.codexModel || '');
+  const config = { ...rawConfig };
+  if (codexModel) {
+    config.codex_model = codexModel;
+    config.codexModel = codexModel;
+  }
   const job = {
     job_id: jobId,
     status: 'queued',
@@ -215,7 +232,8 @@ app.post('/v1/codex/jobs', auth, (req, res) => {
     created_utc: now(),
     updated_utc: now(),
     source: req.body.source || {},
-    config: req.body.config || {},
+    config,
+    codex_model: codexModel,
     handoff: storedHandoff,
     log_tail: '',
     stdout_tail: '',
@@ -245,6 +263,7 @@ app.get('/v1/codex/jobs/:id/ping', auth, (req, res) => {
     progress: job.progress,
     message: job.message,
     phase: job.phase || '',
+    codex_model: jobCodexModel(job),
     updated_utc: job.updated_utc,
     finished_utc: job.finished_utc || null
   }});
@@ -292,10 +311,15 @@ app.post('/v1/agent/jobs/:id/status', auth, (req, res) => {
   if (body.stderr_tail) job.stderr_tail = safeTail(body.stderr_tail, 8000);
   if (body.final_text) job.final_text = safeTail(body.final_text, 40000);
   if (body.error) job.error = safeTail(body.error, 4000);
+  const reportedModel = normalizeCodexModel(body.codex_model || body.codexModel || (body.meta && (body.meta.codex_model || body.meta.codexModel)) || '');
+  if (reportedModel) {
+    job.codex_model = reportedModel;
+    job.config = { ...(job.config || {}), codex_model: reportedModel, codexModel: reportedModel };
+  }
   if (looksLikeContextWindowError([job.error, job.message, job.log_tail, job.stdout_tail, job.stderr_tail, job.final_text])) {
     job.meta = { ...(job.meta || {}), context_window_failure: true };
   }
-  if (body.meta && typeof body.meta === 'object') job.meta = body.meta;
+  if (body.meta && typeof body.meta === 'object') job.meta = { ...(job.meta || {}), ...body.meta };
   if (job.status === 'complete' || job.status === 'error' || job.status === 'failed' || job.status === 'paused') job.finished_utc = now();
   job.updated_utc = now();
   persistJobs();
