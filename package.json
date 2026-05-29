@@ -1,6 +1,6 @@
 {
   "name": "raidbound-codex-railway-relay",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "private": true,
   "type": "commonjs",
   "main": "server.js",
@@ -10,5 +10,5 @@
   "dependencies": {
     "express": "^4.19.2"
   },
-  "description": "Persistent Railway relay for Raidbound Codex Autopilot jobs with stale-claim requeue recovery, context-window metadata, and readable object errors."
+  "description": "Persistent fast-status Railway relay for Raidbound Codex Autopilot jobs with split handoff storage and stale-claim recovery."
 }

@@ -12,6 +12,7 @@ const JOB_TTL_MS = parseInt(process.env.JOB_TTL_MS || String(24 * 60 * 60 * 1000
 const CLAIM_STALE_MS = parseInt(process.env.CLAIM_STALE_MS || String(2 * 60 * 60 * 1000), 10);
 const DATA_DIR = path.resolve(process.env.RBOUR_RELAY_DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(process.cwd(), 'data'));
 const JOBS_FILE = path.join(DATA_DIR, 'codex-jobs.json');
+const HANDOFF_DIR = path.join(DATA_DIR, 'handoffs');
 const jobs = new Map();
 
 function now() { return new Date().toISOString(); }
@@ -22,27 +23,6 @@ function writeJsonAtomic(file, value) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
   fs.renameSync(tmp, file);
-}
-function loadJobs() {
-  try {
-    if (!fs.existsSync(JOBS_FILE)) return;
-    const raw = fs.readFileSync(JOBS_FILE, 'utf8');
-    const parsed = raw ? JSON.parse(raw) : [];
-    const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.jobs) ? parsed.jobs : []);
-    for (const job of list) {
-      if (!job || !job.job_id) continue;
-      jobs.set(job.job_id, job);
-    }
-  } catch (err) {
-    console.error('Could not load persisted relay jobs:', err.message);
-  }
-}
-function persistJobs() {
-  try {
-    writeJsonAtomic(JOBS_FILE, { saved_utc: now(), jobs: Array.from(jobs.values()) });
-  } catch (err) {
-    console.error('Could not persist relay jobs:', err.message);
-  }
 }
 function stringifyForRelay(value) {
   if (value == null) return '';
@@ -66,7 +46,58 @@ function looksLikeContextWindowError(value) {
   const text = stringifyForRelay(value).toLowerCase();
   return !!text && (text.includes('ran out of room in the model') || text.includes('context window') || text.includes('start a new thread') || text.includes('clear earlier history') || text.includes('maximum context') || text.includes('context length') || text.includes('too many tokens') || text.includes('token limit exceeded') || text.includes('input is too large'));
 }
-function publicJob(job) {
+function handoffPathFor(jobId) {
+  return path.join(HANDOFF_DIR, jobId + '.zip.b64');
+}
+function writeHandoffZip(jobId, zipBase64) {
+  mkdirp(HANDOFF_DIR);
+  const file = handoffPathFor(jobId);
+  fs.writeFileSync(file, String(zipBase64 || ''), 'utf8');
+  return file;
+}
+function readHandoffZip(job) {
+  if (job && job.handoff && job.handoff.zip_base64) return job.handoff.zip_base64;
+  const zipFile = job && job.handoff && (job.handoff.zip_file || job.handoff.zip_path);
+  if (zipFile && fs.existsSync(zipFile)) return fs.readFileSync(zipFile, 'utf8');
+  const fallback = job && job.job_id ? handoffPathFor(job.job_id) : '';
+  if (fallback && fs.existsSync(fallback)) return fs.readFileSync(fallback, 'utf8');
+  return '';
+}
+function jobForPersistence(job) {
+  const copy = { ...job, handoff: { ...(job.handoff || {}) } };
+  if (copy.handoff.zip_base64) delete copy.handoff.zip_base64;
+  if (job.job_id && !copy.handoff.zip_file) copy.handoff.zip_file = handoffPathFor(job.job_id);
+  copy.handoff.has_zip = !!readHandoffZip(job);
+  return copy;
+}
+function loadJobs() {
+  try {
+    if (!fs.existsSync(JOBS_FILE)) return;
+    const raw = fs.readFileSync(JOBS_FILE, 'utf8');
+    const parsed = raw ? JSON.parse(raw) : [];
+    const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.jobs) ? parsed.jobs : []);
+    for (const job of list) {
+      if (!job || !job.job_id) continue;
+      if (job.handoff && job.handoff.zip_base64) {
+        const file = writeHandoffZip(job.job_id, job.handoff.zip_base64);
+        delete job.handoff.zip_base64;
+        job.handoff.zip_file = file;
+        job.handoff.has_zip = true;
+      }
+      jobs.set(job.job_id, job);
+    }
+  } catch (err) {
+    console.error('Could not load persisted relay jobs:', err.message);
+  }
+}
+function persistJobs() {
+  try {
+    writeJsonAtomic(JOBS_FILE, { saved_utc: now(), jobs: Array.from(jobs.values()).map(jobForPersistence) });
+  } catch (err) {
+    console.error('Could not persist relay jobs:', err.message);
+  }
+}
+function compactJob(job) {
   return {
     job_id: job.job_id,
     status: job.status,
@@ -76,22 +107,42 @@ function publicJob(job) {
     updated_utc: job.updated_utc,
     claimed_utc: job.claimed_utc || null,
     finished_utc: job.finished_utc || null,
+    agent_id: job.agent_id || '',
+    phase: job.phase || '',
     source: job.source || {},
     config: job.config || {},
     handoff: {
       filename: job.handoff && job.handoff.filename,
       url: job.handoff && job.handoff.url,
       count: job.handoff && job.handoff.count,
-      has_zip: !!(job.handoff && job.handoff.zip_base64)
+      has_zip: !!readHandoffZip(job)
     },
-    agent_id: job.agent_id || '',
-    phase: job.phase || '',
-    log_tail: safeTail([job.final_text, job.log_tail, job.stdout_tail, job.stderr_tail].filter(Boolean).join('\n')),
-    stdout_tail: safeTail(job.stdout_tail || ''),
-    stderr_tail: safeTail(job.stderr_tail || ''),
-    final_text: safeTail(job.final_text || '', 40000),
-    error: safeTail(job.error || '', 8000),
+    log_tail: safeTail([job.log_tail, job.stdout_tail, job.stderr_tail].filter(Boolean).join('\n'), 6000),
+    stdout_tail: safeTail(job.stdout_tail || '', 3000),
+    stderr_tail: safeTail(job.stderr_tail || '', 3000),
+    final_text: ['complete', 'completed', 'success', 'error', 'failed', 'paused'].includes(String(job.status || '').toLowerCase()) ? safeTail(job.final_text || '', 12000) : '',
+    error: safeTail(job.error || '', 4000),
     meta: job.meta || {}
+  };
+}
+function publicJob(job, opts = {}) {
+  if (opts.lite) return compactJob(job);
+  return {
+    ...compactJob(job),
+    log_tail: safeTail([job.final_text, job.log_tail, job.stdout_tail, job.stderr_tail].filter(Boolean).join('\n'), 24000),
+    stdout_tail: safeTail(job.stdout_tail || '', 12000),
+    stderr_tail: safeTail(job.stderr_tail || '', 12000),
+    final_text: safeTail(job.final_text || '', 40000),
+    error: safeTail(job.error || '', 8000)
+  };
+}
+function jobForAgent(job) {
+  return {
+    ...job,
+    handoff: {
+      ...(job.handoff || {}),
+      zip_base64: readHandoffZip(job)
+    }
   };
 }
 function auth(req, res, next) {
@@ -130,14 +181,34 @@ function purgeOldJobs() {
 
 const app = express();
 app.use(express.json({ limit: `${MAX_PAYLOAD_MB}mb` }));
-app.get('/health', (req, res) => res.json({ ok: true, service: 'raidbound-codex-railway-relay', version: '1.1.1', secret_configured: !!SECRET, queued_jobs: jobs.size, supports_meta: true, supports_paused: true, supports_final_text: true, supports_persistence: true, supports_stale_requeue: true, data_dir: DATA_DIR }));
+app.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+
+app.get('/health', (req, res) => res.json({
+  ok: true,
+  service: 'raidbound-codex-railway-relay',
+  version: '1.1.3',
+  secret_configured: !!SECRET,
+  queued_jobs: jobs.size,
+  supports_meta: true,
+  supports_paused: true,
+  supports_final_text: true,
+  supports_persistence: true,
+  supports_stale_requeue: true,
+  supports_fast_status: true,
+  supports_split_handoff_storage: true,
+  data_dir: DATA_DIR
+}));
 
 app.post('/v1/codex/jobs', auth, (req, res) => {
   purgeOldJobs();
   const handoff = req.body && req.body.handoff;
   if (!handoff || !handoff.zip_base64) return res.status(400).json({ error: 'bad_request', message: 'handoff.zip_base64 is required.' });
+  const jobId = id();
+  const zipFile = writeHandoffZip(jobId, handoff.zip_base64);
+  const storedHandoff = { ...handoff, zip_file: zipFile, has_zip: true };
+  delete storedHandoff.zip_base64;
   const job = {
-    job_id: id(),
+    job_id: jobId,
     status: 'queued',
     progress: 5,
     message: 'Queued on Railway relay. Waiting for local Unity Codex agent to poll.',
@@ -145,7 +216,7 @@ app.post('/v1/codex/jobs', auth, (req, res) => {
     updated_utc: now(),
     source: req.body.source || {},
     config: req.body.config || {},
-    handoff,
+    handoff: storedHandoff,
     log_tail: '',
     stdout_tail: '',
     stderr_tail: '',
@@ -155,13 +226,28 @@ app.post('/v1/codex/jobs', auth, (req, res) => {
   };
   jobs.set(job.job_id, job);
   persistJobs();
-  res.json({ job: publicJob(job) });
+  res.json({ job: publicJob(job, { lite: true }) });
 });
 
 app.get('/v1/codex/jobs/:id', auth, (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'not_found', message: 'Job not found or expired.' });
-  res.json({ job: publicJob(job) });
+  const lite = String(req.query.lite || '').toLowerCase() === '1' || String(req.query.lite || '').toLowerCase() === 'true';
+  res.json({ job: publicJob(job, { lite }) });
+});
+
+app.get('/v1/codex/jobs/:id/ping', auth, (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'not_found', message: 'Job not found or expired.' });
+  res.json({ job: {
+    job_id: job.job_id,
+    status: job.status,
+    progress: job.progress,
+    message: job.message,
+    phase: job.phase || '',
+    updated_utc: job.updated_utc,
+    finished_utc: job.finished_utc || null
+  }});
 });
 
 app.get('/v1/agent/jobs/next', auth, (req, res) => {
@@ -176,7 +262,18 @@ app.get('/v1/agent/jobs/next', auth, (req, res) => {
       job.claimed_utc = now();
       job.updated_utc = now();
       persistJobs();
-      return res.json({ job });
+      const agentJob = jobForAgent(job);
+      if (!agentJob.handoff.zip_base64) {
+        job.status = 'error';
+        job.progress = 100;
+        job.message = 'Relay could not load the stored handoff ZIP for the local agent.';
+        job.error = job.message;
+        job.finished_utc = now();
+        job.updated_utc = now();
+        persistJobs();
+        return res.status(500).json({ error: 'handoff_missing', message: job.message });
+      }
+      return res.json({ job: agentJob });
     }
   }
   res.status(204).send('');
@@ -189,12 +286,12 @@ app.post('/v1/agent/jobs/:id/status', auth, (req, res) => {
   if (body.status) job.status = String(body.status);
   if (body.phase) job.phase = String(body.phase);
   if (body.progress != null) job.progress = Math.max(0, Math.min(100, parseInt(body.progress, 10) || 0));
-  if (body.message) job.message = safeTail(body.message, 8000);
-  if (body.log_tail) job.log_tail = safeTail(body.log_tail);
-  if (body.stdout_tail) job.stdout_tail = safeTail(body.stdout_tail);
-  if (body.stderr_tail) job.stderr_tail = safeTail(body.stderr_tail);
+  if (body.message) job.message = safeTail(body.message, 4000);
+  if (body.log_tail) job.log_tail = safeTail(body.log_tail, 8000);
+  if (body.stdout_tail) job.stdout_tail = safeTail(body.stdout_tail, 8000);
+  if (body.stderr_tail) job.stderr_tail = safeTail(body.stderr_tail, 8000);
   if (body.final_text) job.final_text = safeTail(body.final_text, 40000);
-  if (body.error) job.error = safeTail(body.error, 8000);
+  if (body.error) job.error = safeTail(body.error, 4000);
   if (looksLikeContextWindowError([job.error, job.message, job.log_tail, job.stdout_tail, job.stderr_tail, job.final_text])) {
     job.meta = { ...(job.meta || {}), context_window_failure: true };
   }
@@ -202,11 +299,12 @@ app.post('/v1/agent/jobs/:id/status', auth, (req, res) => {
   if (job.status === 'complete' || job.status === 'error' || job.status === 'failed' || job.status === 'paused') job.finished_utc = now();
   job.updated_utc = now();
   persistJobs();
-  res.json({ job: publicJob(job) });
+  res.json({ job: publicJob(job, { lite: true }) });
 });
 
 loadJobs();
 app.listen(PORT, () => {
   console.log(`Raidbound Codex Railway Relay listening on ${PORT}`);
   console.log(`Persisting relay jobs to ${JOBS_FILE}`);
+  console.log(`Persisting handoff zip payloads to ${HANDOFF_DIR}`);
 });
